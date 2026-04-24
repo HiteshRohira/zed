@@ -29,6 +29,27 @@ pub struct Request {
     pub prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<ResponseTextConfig>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct ResponseTextConfig {
+    pub verbosity: ResponseTextVerbosity,
+}
+
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponseTextVerbosity {
+    Low,
+    Medium,
+    High,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,6 +58,7 @@ pub enum ResponseInputItem {
     Message(ResponseMessageItem),
     FunctionCall(ResponseFunctionCallItem),
     FunctionCallOutput(ResponseFunctionCallOutputItem),
+    Reasoning(ResponseReasoningInputItem),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,6 +78,15 @@ pub struct ResponseFunctionCallItem {
 pub struct ResponseFunctionCallOutputItem {
     pub call_id: String,
     pub output: ResponseFunctionCallOutputContent,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResponseReasoningInputItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub summary: Vec<ReasoningSummaryPart>,
+    pub encrypted_content: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -271,9 +302,11 @@ pub struct ResponseReasoningItem {
     pub id: Option<String>,
     #[serde(default)]
     pub summary: Vec<ReasoningSummaryPart>,
+    #[serde(default)]
+    pub encrypted_content: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningSummaryPart {
     SummaryText {
@@ -309,6 +342,18 @@ pub struct ResponseFunctionToolCall {
     pub status: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RequestOptions {
+    pub path: &'static str,
+    pub extra_headers: Vec<(String, String)>,
+}
+
+impl RequestOptions {
+    pub fn default_responses_path() -> &'static str {
+        "/responses"
+    }
+}
+
 pub async fn stream_response(
     client: &dyn HttpClient,
     provider_name: &str,
@@ -316,12 +361,42 @@ pub async fn stream_response(
     api_key: &str,
     request: Request,
 ) -> Result<BoxStream<'static, Result<StreamEvent>>, RequestError> {
-    let uri = format!("{api_url}/responses");
-    let request_builder = HttpRequest::builder()
+    stream_response_with_options(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        request,
+        RequestOptions {
+            path: RequestOptions::default_responses_path(),
+            extra_headers: Vec::new(),
+        },
+    )
+    .await
+}
+
+pub async fn stream_response_with_options(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    request: Request,
+    options: RequestOptions,
+) -> Result<BoxStream<'static, Result<StreamEvent>>, RequestError> {
+    let path = if options.path.is_empty() {
+        RequestOptions::default_responses_path()
+    } else {
+        options.path
+    };
+    let uri = format!("{api_url}{path}");
+    let mut request_builder = HttpRequest::builder()
         .method(Method::POST)
         .uri(uri)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_key.trim()));
+    for (header_name, header_value) in options.extra_headers {
+        request_builder = request_builder.header(header_name, header_value);
+    }
 
     let is_streaming = request.stream;
     let request = request_builder

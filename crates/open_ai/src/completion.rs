@@ -12,9 +12,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::responses::{
-    Request as ResponseRequest, ResponseFunctionCallItem, ResponseFunctionCallOutputContent,
-    ResponseFunctionCallOutputItem, ResponseInputContent, ResponseInputItem, ResponseMessageItem,
-    ResponseOutputItem, ResponseSummary as ResponsesSummary, ResponseUsage as ResponsesUsage,
+    ReasoningSummaryPart, Request as ResponseRequest, ResponseFunctionCallItem,
+    ResponseFunctionCallOutputContent, ResponseFunctionCallOutputItem, ResponseInputContent,
+    ResponseInputItem, ResponseMessageItem, ResponseOutputItem, ResponseReasoningInputItem,
+    ResponseSummary as ResponsesSummary, ResponseUsage as ResponsesUsage,
     StreamEvent as ResponsesStreamEvent,
 };
 use crate::{
@@ -180,8 +181,16 @@ pub fn into_open_ai_response(
         speed: _,
     } = request;
 
+    let mut instructions = String::new();
     let mut input_items = Vec::new();
     for (index, message) in messages.into_iter().enumerate() {
+        if message.role == Role::System {
+            if !instructions.is_empty() {
+                instructions.push_str("\n\n");
+            }
+            instructions.push_str(&message.string_contents());
+            continue;
+        }
         append_message_to_response_items(message, index, &mut input_items);
     }
 
@@ -222,6 +231,10 @@ pub fn into_open_ai_response(
             effort,
             summary: Some(crate::responses::ReasoningSummaryMode::Auto),
         }),
+        store: None,
+        instructions: (!instructions.trim().is_empty()).then_some(instructions),
+        include: Vec::new(),
+        text: None,
     }
 }
 
@@ -230,7 +243,9 @@ fn append_message_to_response_items(
     index: usize,
     input_items: &mut Vec<ResponseInputItem>,
 ) {
+    let reasoning_details = message.reasoning_details.clone();
     let mut content_parts: Vec<ResponseInputContent> = Vec::new();
+    let mut reasoning_item_added = false;
 
     for content in message.content {
         match content {
@@ -240,9 +255,17 @@ fn append_message_to_response_items(
             MessageContent::Thinking { text, .. } => {
                 push_response_text_part(&message.role, text, &mut content_parts);
             }
-            MessageContent::RedactedThinking(_) => {}
             MessageContent::Image(image) => {
                 push_response_image_part(&message.role, image, &mut content_parts);
+            }
+            MessageContent::RedactedThinking(data) => {
+                flush_response_parts(&message.role, index, &mut content_parts, input_items);
+                input_items.push(ResponseInputItem::Reasoning(ResponseReasoningInputItem {
+                    id: None,
+                    summary: Vec::new(),
+                    encrypted_content: data,
+                }));
+                reasoning_item_added = true;
             }
             MessageContent::ToolUse(tool_use) => {
                 flush_response_parts(&message.role, index, &mut content_parts, input_items);
@@ -277,6 +300,19 @@ fn append_message_to_response_items(
     }
 
     flush_response_parts(&message.role, index, &mut content_parts, input_items);
+
+    if !reasoning_item_added
+        && let Some(reasoning_details) = reasoning_details
+        && let Some(encrypted_content) = reasoning_details
+            .get("encrypted_content")
+            .and_then(|value| value.as_str())
+    {
+        input_items.push(ResponseInputItem::Reasoning(ResponseReasoningInputItem {
+            id: None,
+            summary: Vec::new(),
+            encrypted_content: encrypted_content.to_string(),
+        }));
+    }
 }
 
 fn push_response_text_part(
@@ -710,8 +746,36 @@ impl OpenAiResponseEventMapper {
                     Vec::new()
                 }
             }
+            ResponsesStreamEvent::OutputItemDone { item, .. } => match item {
+                ResponseOutputItem::Reasoning(reasoning) => {
+                    let mut events = Vec::new();
+                    if let Some(encrypted_content) = reasoning.encrypted_content {
+                        events.push(Ok(LanguageModelCompletionEvent::RedactedThinking {
+                            data: encrypted_content.clone(),
+                        }));
+                        let summary_text = reasoning
+                            .summary
+                            .into_iter()
+                            .filter_map(|part| match part {
+                                ReasoningSummaryPart::SummaryText { text } => Some(text),
+                                ReasoningSummaryPart::Unknown => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        events.push(Ok(LanguageModelCompletionEvent::ReasoningDetails(
+                            serde_json::json!({
+                                "encrypted_content": encrypted_content,
+                                "summary_text": summary_text,
+                            }),
+                        )));
+                    }
+                    events
+                }
+                ResponseOutputItem::Message(_)
+                | ResponseOutputItem::FunctionCall(_)
+                | ResponseOutputItem::Unknown => Vec::new(),
+            },
             ResponsesStreamEvent::OutputTextDone { .. }
-            | ResponsesStreamEvent::OutputItemDone { .. }
             | ResponsesStreamEvent::ContentPartAdded { .. }
             | ResponsesStreamEvent::ContentPartDone { .. }
             | ResponsesStreamEvent::ReasoningSummaryTextDone { .. }
@@ -853,12 +917,14 @@ pub fn count_open_ai_tokens(request: LanguageModelRequest, model: Model) -> Resu
         | Model::FiveCodex
         | Model::FiveMini
         | Model::FiveNano => tiktoken_rs::num_tokens_from_messages(model.id(), &messages),
-        // GPT-5.1, 5.2, 5.2-codex, 5.3-codex, 5.4, and 5.4-pro don't have dedicated tiktoken support; use gpt-5 tokenizer
+        // GPT-5.1, 5.2, 5.2-codex, 5.3-codex, 5.4, 5.4-mini, and 5.4-pro don't have dedicated
+        // tiktoken support; use the gpt-5 tokenizer.
         Model::FivePointOne
         | Model::FivePointTwo
         | Model::FivePointTwoCodex
         | Model::FivePointThreeCodex
         | Model::FivePointFour
+        | Model::FivePointFourMini
         | Model::FivePointFourPro => tiktoken_rs::num_tokens_from_messages("gpt-5", &messages),
     }
     .map(|tokens| tokens as u64)
@@ -1078,14 +1144,8 @@ mod tests {
         let serialized = serde_json::to_value(&response).unwrap();
         let expected = json!({
             "model": "custom-model",
+            "instructions": "System context",
             "input": [
-                {
-                    "type": "message",
-                    "role": "system",
-                    "content": [
-                        { "type": "input_text", "text": "System context" }
-                    ]
-                },
                 {
                     "type": "message",
                     "role": "user",
@@ -1130,6 +1190,51 @@ mod tests {
         });
 
         assert_eq!(serialized, expected);
+    }
+
+    #[test]
+    fn into_open_ai_response_includes_encrypted_reasoning_items() {
+        let request = LanguageModelRequest {
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::Assistant,
+                content: vec![
+                    MessageContent::RedactedThinking("encrypted-token".into()),
+                    MessageContent::Text("Visible text".into()),
+                ],
+                cache: false,
+                reasoning_details: None,
+            }],
+            tools: Vec::new(),
+            tool_choice: None,
+            stop: Vec::new(),
+            temperature: None,
+            thinking_allowed: false,
+            thinking_effort: None,
+            speed: None,
+        };
+
+        let response = into_open_ai_response(request, "gpt-5.2-codex", true, true, None, None);
+        let serialized = serde_json::to_value(&response).unwrap();
+
+        assert_eq!(
+            serialized["input"],
+            json!([
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "encrypted-token"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        { "type": "output_text", "text": "Visible text", "annotations": [] }
+                    ]
+                }
+            ])
+        );
     }
 
     #[test]
@@ -1547,6 +1652,7 @@ mod tests {
                 item: ResponseOutputItem::Reasoning(ResponseReasoningItem {
                     id: Some("rs_123".into()),
                     summary: vec![],
+                    encrypted_content: None,
                 }),
             },
             ResponsesStreamEvent::ReasoningSummaryPartAdded {
@@ -1607,6 +1713,7 @@ mod tests {
                             text: "Second part".into(),
                         },
                     ],
+                    encrypted_content: None,
                 }),
             },
             ResponsesStreamEvent::OutputItemAdded {
@@ -1665,6 +1772,7 @@ mod tests {
                 item: ResponseOutputItem::Reasoning(ResponseReasoningItem {
                     id: Some("rs_789".into()),
                     summary: vec![],
+                    encrypted_content: None,
                 }),
             },
             ResponsesStreamEvent::OutputItemDone {
@@ -1675,6 +1783,7 @@ mod tests {
                     summary: vec![ReasoningSummaryPart::SummaryText {
                         text: "Summary without deltas".into(),
                     }],
+                    encrypted_content: None,
                 }),
             },
             ResponsesStreamEvent::Completed {
@@ -1689,5 +1798,37 @@ mod tests {
                 .any(|e| matches!(e, LanguageModelCompletionEvent::Thinking { .. })),
             "OutputItemDone reasoning should not produce Thinking events"
         );
+    }
+
+    #[test]
+    fn responses_stream_maps_encrypted_reasoning_details() {
+        let events = vec![
+            ResponsesStreamEvent::OutputItemDone {
+                output_index: 0,
+                sequence_number: None,
+                item: ResponseOutputItem::Reasoning(ResponseReasoningItem {
+                    id: Some("rs_999".into()),
+                    summary: vec![ReasoningSummaryPart::SummaryText {
+                        text: "Hidden chain".into(),
+                    }],
+                    encrypted_content: Some("opaque-token".into()),
+                }),
+            },
+            ResponsesStreamEvent::Completed {
+                response: ResponseSummary::default(),
+            },
+        ];
+
+        let mapped = map_response_events(events);
+
+        assert!(mapped.iter().any(|event| matches!(
+            event,
+            LanguageModelCompletionEvent::RedactedThinking { data } if data == "opaque-token"
+        )));
+        assert!(mapped.iter().any(|event| matches!(
+            event,
+            LanguageModelCompletionEvent::ReasoningDetails(details)
+                if details["encrypted_content"] == "opaque-token"
+        )));
     }
 }

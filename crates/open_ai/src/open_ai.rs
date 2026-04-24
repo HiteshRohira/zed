@@ -56,7 +56,7 @@ impl From<Role> for String {
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, EnumIter)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, EnumIter)]
 pub enum Model {
     #[serde(rename = "gpt-3.5-turbo")]
     ThreePointFiveTurbo,
@@ -79,7 +79,6 @@ pub enum Model {
     #[serde(rename = "gpt-5-codex")]
     FiveCodex,
     #[serde(rename = "gpt-5-mini")]
-    #[default]
     FiveMini,
     #[serde(rename = "gpt-5-nano")]
     FiveNano,
@@ -93,6 +92,8 @@ pub enum Model {
     FivePointThreeCodex,
     #[serde(rename = "gpt-5.4")]
     FivePointFour,
+    #[serde(rename = "gpt-5.4-mini")]
+    FivePointFourMini,
     #[serde(rename = "gpt-5.4-pro")]
     FivePointFourPro,
     #[serde(rename = "custom")]
@@ -109,13 +110,19 @@ pub enum Model {
     },
 }
 
+impl Default for Model {
+    fn default() -> Self {
+        Self::FivePointFour
+    }
+}
+
 const fn default_supports_chat_completions() -> bool {
     true
 }
 
 impl Model {
     pub fn default_fast() -> Self {
-        Self::FiveMini
+        Self::FivePointFourMini
     }
 
     pub fn from_id(id: &str) -> Result<Self> {
@@ -137,6 +144,7 @@ impl Model {
             "gpt-5.2-codex" => Ok(Self::FivePointTwoCodex),
             "gpt-5.3-codex" => Ok(Self::FivePointThreeCodex),
             "gpt-5.4" => Ok(Self::FivePointFour),
+            "gpt-5.4-mini" => Ok(Self::FivePointFourMini),
             "gpt-5.4-pro" => Ok(Self::FivePointFourPro),
             invalid_id => anyhow::bail!("invalid model id '{invalid_id}'"),
         }
@@ -161,6 +169,7 @@ impl Model {
             Self::FivePointTwoCodex => "gpt-5.2-codex",
             Self::FivePointThreeCodex => "gpt-5.3-codex",
             Self::FivePointFour => "gpt-5.4",
+            Self::FivePointFourMini => "gpt-5.4-mini",
             Self::FivePointFourPro => "gpt-5.4-pro",
             Self::Custom { name, .. } => name,
         }
@@ -185,6 +194,7 @@ impl Model {
             Self::FivePointTwoCodex => "gpt-5.2-codex",
             Self::FivePointThreeCodex => "gpt-5.3-codex",
             Self::FivePointFour => "gpt-5.4",
+            Self::FivePointFourMini => "gpt-5.4-mini",
             Self::FivePointFourPro => "gpt-5.4-pro",
             Self::Custom { display_name, .. } => display_name.as_deref().unwrap_or(&self.id()),
         }
@@ -209,6 +219,7 @@ impl Model {
             Self::FivePointTwoCodex => 400_000,
             Self::FivePointThreeCodex => 400_000,
             Self::FivePointFour => 1_050_000,
+            Self::FivePointFourMini => 400_000,
             Self::FivePointFourPro => 1_050_000,
             Self::Custom { max_tokens, .. } => *max_tokens,
         }
@@ -236,6 +247,7 @@ impl Model {
             Self::FivePointTwoCodex => Some(128_000),
             Self::FivePointThreeCodex => Some(128_000),
             Self::FivePointFour => Some(128_000),
+            Self::FivePointFourMini => Some(128_000),
             Self::FivePointFourPro => Some(128_000),
         }
     }
@@ -245,7 +257,9 @@ impl Model {
             Self::Custom {
                 reasoning_effort, ..
             } => reasoning_effort.to_owned(),
-            Self::FivePointThreeCodex | Self::FivePointFourPro => Some(ReasoningEffort::Medium),
+            Self::FivePointThreeCodex
+            | Self::FivePointFourMini
+            | Self::FivePointFourPro => Some(ReasoningEffort::Medium),
             _ => None,
         }
     }
@@ -259,6 +273,7 @@ impl Model {
             Self::FiveCodex
             | Self::FivePointTwoCodex
             | Self::FivePointThreeCodex
+            | Self::FivePointFourMini
             | Self::FivePointFourPro => false,
             _ => true,
         }
@@ -282,6 +297,7 @@ impl Model {
             | Self::FivePointTwoCodex
             | Self::FivePointThreeCodex
             | Self::FivePointFour
+            | Self::FivePointFourMini
             | Self::FivePointFourPro
             | Self::FiveNano => true,
             Self::O1 | Self::O3 | Self::O3Mini | Model::Custom { .. } => false,

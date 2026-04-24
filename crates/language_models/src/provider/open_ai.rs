@@ -1,3 +1,5 @@
+mod codex;
+
 use anyhow::Result;
 use collections::BTreeMap;
 use credentials_provider::CredentialsProvider;
@@ -14,7 +16,11 @@ use language_model::{
 use menu;
 use open_ai::{
     OPEN_AI_API_URL, ResponseStreamEvent,
-    responses::{Request as ResponseRequest, StreamEvent as ResponsesStreamEvent, stream_response},
+    responses::{
+        Request as ResponseRequest, RequestOptions as OpenAiResponseRequestOptions,
+        ResponseTextConfig, ResponseTextVerbosity, StreamEvent as ResponsesStreamEvent,
+        stream_response, stream_response_with_options,
+    },
     stream_completion,
 };
 use settings::{OpenAiAvailableModel as AvailableModel, Settings, SettingsStore};
@@ -28,6 +34,8 @@ pub use open_ai::completion::{
     OpenAiEventMapper, OpenAiResponseEventMapper, collect_tiktoken_messages, count_open_ai_tokens,
     into_open_ai, into_open_ai_response,
 };
+
+use self::codex::{CodexAuthSession, PendingCodexOAuthFlow};
 
 const PROVIDER_ID: LanguageModelProviderId = OPEN_AI_PROVIDER_ID;
 const PROVIDER_NAME: LanguageModelProviderName = OPEN_AI_PROVIDER_NAME;
@@ -49,11 +57,13 @@ pub struct OpenAiLanguageModelProvider {
 pub struct State {
     api_key_state: ApiKeyState,
     credentials_provider: Arc<dyn CredentialsProvider>,
+    http_client: Arc<dyn HttpClient>,
+    codex_auth_session: Option<CodexAuthSession>,
 }
 
 impl State {
     fn is_authenticated(&self) -> bool {
-        self.api_key_state.has_key()
+        self.codex_auth_session.is_some() || self.api_key_state.has_key()
     }
 
     fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -68,15 +78,69 @@ impl State {
         )
     }
 
+    fn set_codex_auth_session(
+        &mut self,
+        session: Option<CodexAuthSession>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let credentials_provider = self.credentials_provider.clone();
+        cx.spawn(async move |this, cx| {
+            match session.as_ref() {
+                Some(session) => {
+                    codex::store_session(credentials_provider.as_ref(), session, cx).await?
+                }
+                None => codex::delete_session(credentials_provider.as_ref(), cx).await?,
+            }
+
+            this.update(cx, |this, cx| {
+                this.codex_auth_session = session;
+                cx.notify();
+            })
+        })
+    }
+
     fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
         let credentials_provider = self.credentials_provider.clone();
         let api_url = OpenAiLanguageModelProvider::api_url(cx);
-        self.api_key_state.load_if_needed(
+        let api_key_task = self.api_key_state.load_if_needed(
             api_url,
             |this| &mut this.api_key_state,
-            credentials_provider,
+            credentials_provider.clone(),
             cx,
-        )
+        );
+
+        cx.spawn(async move |this, cx| {
+            if let Some(session) = codex::load_session(credentials_provider.as_ref(), cx).await? {
+                this.update(cx, |this, cx| {
+                    this.codex_auth_session = Some(session);
+                    cx.notify();
+                })?;
+                return Ok(());
+            }
+
+            api_key_task.await
+        })
+    }
+
+    fn clear_credentials(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let credentials_provider = self.credentials_provider.clone();
+        let api_url = OpenAiLanguageModelProvider::api_url(cx);
+        cx.spawn(async move |this, cx| {
+            credentials_provider
+                .delete_credentials(&api_url, cx)
+                .await
+                .log_err();
+            credentials_provider
+                .delete_credentials(codex::CREDENTIALS_KEY, cx)
+                .await
+                .log_err();
+
+            this.update(cx, |this, cx| {
+                this.api_key_state = ApiKeyState::new(api_url, (*API_KEY_ENV_VAR).clone());
+                this.codex_auth_session = None;
+                cx.notify();
+            })
+        })
     }
 }
 
@@ -102,6 +166,8 @@ impl OpenAiLanguageModelProvider {
             State {
                 api_key_state: ApiKeyState::new(Self::api_url(cx), (*API_KEY_ENV_VAR).clone()),
                 credentials_provider,
+                http_client: http_client.clone(),
+                codex_auth_session: None,
             }
         });
 
@@ -213,7 +279,7 @@ impl LanguageModelProvider for OpenAiLanguageModelProvider {
 
     fn reset_credentials(&self, cx: &mut App) -> Task<Result<()>> {
         self.state
-            .update(cx, |state, cx| state.set_api_key(None, cx))
+            .update(cx, |state, cx| state.clear_credentials(cx))
     }
 }
 
@@ -225,7 +291,77 @@ pub struct OpenAiLanguageModel {
     request_limiter: RateLimiter,
 }
 
+enum OpenAiAuthTransport {
+    ApiKey {
+        api_key: Arc<str>,
+        api_url: SharedString,
+    },
+    CodexSubscription {
+        access_token: String,
+        account_id: String,
+        api_url: &'static str,
+    },
+}
+
 impl OpenAiLanguageModel {
+    async fn auth_transport(
+        state: Entity<State>,
+        cx: &mut AsyncApp,
+    ) -> Result<OpenAiAuthTransport, LanguageModelCompletionError> {
+        let snapshot = state.read_with(cx, |state, cx| {
+            let api_url = OpenAiLanguageModelProvider::api_url(cx);
+            (
+                state.codex_auth_session.clone(),
+                state.api_key_state.key(&api_url),
+                api_url,
+                state.credentials_provider.clone(),
+                state.http_client.clone(),
+            )
+        });
+
+        let (codex_session, api_key, api_url, credentials_provider, http_client) = snapshot;
+
+        if let Some(session) = codex_session {
+            let session = if session.should_refresh() {
+                let refreshed = codex::refresh_session(http_client, &session)
+                    .await
+                    .map_err(|error| LanguageModelCompletionError::AuthenticationError {
+                        provider: PROVIDER_NAME,
+                        message: format!("Failed to refresh ChatGPT subscription session: {error}"),
+                    })?;
+                codex::store_session(credentials_provider.as_ref(), &refreshed, cx)
+                    .await
+                    .log_err();
+                state.update(cx, |state, cx| {
+                    state.codex_auth_session = Some(refreshed.clone());
+                    cx.notify();
+                });
+                refreshed
+            } else {
+                session
+            };
+
+            return Ok(OpenAiAuthTransport::CodexSubscription {
+                access_token: session.access_token,
+                account_id: session.account_id,
+                api_url: "https://chatgpt.com/backend-api",
+            });
+        }
+
+        let Some(api_key) = api_key else {
+            return Err(LanguageModelCompletionError::NoApiKey {
+                provider: PROVIDER_NAME,
+            });
+        };
+
+        Ok(OpenAiAuthTransport::ApiKey { api_key, api_url })
+    }
+
+    fn uses_codex_subscription(&self, cx: &AsyncApp) -> bool {
+        self.state
+            .read_with(cx, |state, _| state.codex_auth_session.is_some())
+    }
+
     fn stream_completion(
         &self,
         request: open_ai::Request,
@@ -233,26 +369,35 @@ impl OpenAiLanguageModel {
     ) -> BoxFuture<'static, Result<futures::stream::BoxStream<'static, Result<ResponseStreamEvent>>>>
     {
         let http_client = self.http_client.clone();
-
-        let (api_key, api_url) = self.state.read_with(cx, |state, cx| {
-            let api_url = OpenAiLanguageModelProvider::api_url(cx);
-            (state.api_key_state.key(&api_url), api_url)
-        });
-
-        let future = self.request_limiter.stream(async move {
-            let provider = PROVIDER_NAME;
-            let Some(api_key) = api_key else {
-                return Err(LanguageModelCompletionError::NoApiKey { provider });
-            };
-            let request = stream_completion(
-                http_client.as_ref(),
-                provider.0.as_str(),
-                &api_url,
-                &api_key,
-                request,
-            );
-            let response = request.await?;
-            Ok(response)
+        let state = self.state.clone();
+        let request_limiter = self.request_limiter.clone();
+        let future = cx.spawn(async move |cx| {
+            let transport = Self::auth_transport(state, cx).await?;
+            request_limiter
+                .stream(async move {
+                    match transport {
+                        OpenAiAuthTransport::ApiKey { api_key, api_url } => {
+                            let response = stream_completion(
+                                http_client.as_ref(),
+                                PROVIDER_NAME.0.as_str(),
+                                &api_url,
+                                &api_key,
+                                request,
+                            )
+                            .await?;
+                            Ok(response)
+                        }
+                        OpenAiAuthTransport::CodexSubscription { .. } => {
+                            Err(LanguageModelCompletionError::AuthenticationError {
+                                provider: PROVIDER_NAME,
+                                message:
+                                    "ChatGPT subscription auth must use the Responses API path"
+                                        .to_string(),
+                            })
+                        }
+                    }
+                })
+                .await
         });
 
         async move { Ok(future.await?.boxed()) }.boxed()
@@ -265,26 +410,68 @@ impl OpenAiLanguageModel {
     ) -> BoxFuture<'static, Result<futures::stream::BoxStream<'static, Result<ResponsesStreamEvent>>>>
     {
         let http_client = self.http_client.clone();
+        let state = self.state.clone();
+        let request_limiter = self.request_limiter.clone();
+        let future = cx.spawn(async move |cx| {
+            let transport = Self::auth_transport(state, cx).await?;
+            request_limiter
+                .stream(async move {
+                    match transport {
+                        OpenAiAuthTransport::ApiKey { api_key, api_url } => {
+                            let response = stream_response(
+                                http_client.as_ref(),
+                                PROVIDER_NAME.0.as_str(),
+                                &api_url,
+                                &api_key,
+                                request,
+                            )
+                            .await?;
+                            Ok(response)
+                        }
+                        OpenAiAuthTransport::CodexSubscription {
+                            access_token,
+                            account_id,
+                            api_url,
+                        } => {
+                            let mut request = request;
+                            let mut extra_headers = vec![
+                                (
+                                    "OpenAI-Beta".to_string(),
+                                    "responses=experimental".to_string(),
+                                ),
+                                ("chatgpt-account-id".to_string(), account_id),
+                                ("originator".to_string(), "codex_cli_rs".to_string()),
+                                ("accept".to_string(), "text/event-stream".to_string()),
+                            ];
+                            if let Some(session_id) = request.prompt_cache_key.clone() {
+                                extra_headers.push(("session_id".to_string(), session_id.clone()));
+                                extra_headers.push(("conversation_id".to_string(), session_id));
+                            }
 
-        let (api_key, api_url) = self.state.read_with(cx, |state, cx| {
-            let api_url = OpenAiLanguageModelProvider::api_url(cx);
-            (state.api_key_state.key(&api_url), api_url)
-        });
+                            request.store = Some(false);
+                            request.max_output_tokens = None;
+                            request.include = vec!["reasoning.encrypted_content".to_string()];
+                            request.text = Some(ResponseTextConfig {
+                                verbosity: ResponseTextVerbosity::Medium,
+                            });
 
-        let provider = PROVIDER_NAME;
-        let future = self.request_limiter.stream(async move {
-            let Some(api_key) = api_key else {
-                return Err(LanguageModelCompletionError::NoApiKey { provider });
-            };
-            let request = stream_response(
-                http_client.as_ref(),
-                provider.0.as_str(),
-                &api_url,
-                &api_key,
-                request,
-            );
-            let response = request.await?;
-            Ok(response)
+                            let response = stream_response_with_options(
+                                http_client.as_ref(),
+                                PROVIDER_NAME.0.as_str(),
+                                api_url,
+                                &access_token,
+                                request,
+                                OpenAiResponseRequestOptions {
+                                    path: "/codex/responses",
+                                    extra_headers,
+                                },
+                            )
+                            .await?;
+                            Ok(response)
+                        }
+                    }
+                })
+                .await
         });
 
         async move { Ok(future.await?.boxed()) }.boxed()
@@ -326,6 +513,7 @@ impl LanguageModel for OpenAiLanguageModel {
             | Model::FivePointTwoCodex
             | Model::FivePointThreeCodex
             | Model::FivePointFour
+            | Model::FivePointFourMini
             | Model::FivePointFourPro
             | Model::O1
             | Model::O3 => true,
@@ -393,7 +581,22 @@ impl LanguageModel for OpenAiLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
-        if self.model.supports_chat_completions() {
+        if self.uses_codex_subscription(cx) {
+            let request = into_open_ai_response(
+                request,
+                self.model.id(),
+                self.model.supports_parallel_tool_calls(),
+                self.model.supports_prompt_cache_key(),
+                self.max_output_tokens(),
+                self.model.reasoning_effort(),
+            );
+            let completions = self.stream_response(request, cx);
+            async move {
+                let mapper = OpenAiResponseEventMapper::new();
+                Ok(mapper.map_stream(completions.await?).boxed())
+            }
+            .boxed()
+        } else if self.model.supports_chat_completions() {
             let request = into_open_ai(
                 request,
                 self.model.id(),
@@ -431,6 +634,8 @@ struct ConfigurationView {
     api_key_editor: Entity<InputField>,
     state: Entity<State>,
     load_credentials_task: Option<Task<()>>,
+    codex_login_task: Option<Task<()>>,
+    codex_login_error: Option<SharedString>,
 }
 
 impl ConfigurationView {
@@ -467,6 +672,8 @@ impl ConfigurationView {
             api_key_editor,
             state,
             load_credentials_task,
+            codex_login_task: None,
+            codex_login_error: None,
         }
     }
 
@@ -489,14 +696,44 @@ impl ConfigurationView {
         .detach_and_log_err(cx);
     }
 
-    fn reset_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_codex_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.codex_login_task.is_some() {
+            return;
+        }
+
+        self.codex_login_error = None;
+        let flow = match codex::begin_oauth_flow() {
+            Ok(flow) => flow,
+            Err(error) => {
+                self.codex_login_error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+
+        cx.open_url(&flow.authorization_url);
+
+        let state = self.state.clone();
+        self.codex_login_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = finish_codex_login(flow, state, cx).await;
+            this.update(cx, |this, cx| {
+                this.codex_login_task = None;
+                this.codex_login_error = result.err().map(|error| error.to_string().into());
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    fn reset_credentials(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.api_key_editor
             .update(cx, |input, cx| input.set_text("", window, cx));
 
         let state = self.state.clone();
         cx.spawn_in(window, async move |_, cx| {
             state
-                .update(cx, |state, cx| state.set_api_key(None, cx))
+                .update(cx, |state, cx| state.clear_credentials(cx))
                 .await
         })
         .detach_and_log_err(cx);
@@ -507,24 +744,81 @@ impl ConfigurationView {
     }
 }
 
+async fn finish_codex_login(
+    flow: PendingCodexOAuthFlow,
+    state: Entity<State>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let http_client = state.read_with(cx, |state, _| state.http_client.clone());
+    let session = flow.finish(http_client).await?;
+    let task = state.update(cx, |state, cx| {
+        state.set_codex_auth_session(Some(session), cx)
+    });
+    task.await
+}
+
 impl Render for ConfigurationView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let env_var_set = self.state.read(cx).api_key_state.is_from_env_var();
-        let configured_card_label = if env_var_set {
-            format!("API key set in {API_KEY_ENV_VAR_NAME} environment variable")
-        } else {
-            let api_url = OpenAiLanguageModelProvider::api_url(cx);
-            if api_url == OPEN_AI_API_URL {
-                "API key configured".to_string()
+        let (env_var_set, has_codex_auth, configured_card_label) = {
+            let state = self.state.read(cx);
+            let env_var_set = state.api_key_state.is_from_env_var();
+            let has_codex_auth = state.codex_auth_session.is_some();
+            let configured_card_label = if has_codex_auth {
+                "ChatGPT Plus/Pro Codex subscription configured".to_string()
+            } else if env_var_set {
+                format!("API key set in {API_KEY_ENV_VAR_NAME} environment variable")
             } else {
-                format!("API key configured for {}", api_url)
-            }
+                let api_url = OpenAiLanguageModelProvider::api_url(cx);
+                if api_url == OPEN_AI_API_URL {
+                    "API key configured".to_string()
+                } else {
+                    format!("API key configured for {}", api_url)
+                }
+            };
+            (env_var_set, has_codex_auth, configured_card_label)
         };
 
         let api_key_section = if self.should_render_editor(cx) {
             v_flex()
                 .on_action(cx.listener(Self::save_api_key))
-                .child(Label::new("To use Zed's agent with OpenAI, you need to add an API key. Follow these steps:"))
+                .gap_3()
+                .child(Label::new("Use either an OpenAI API key or your ChatGPT Plus/Pro Codex subscription."))
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(Label::new("ChatGPT Plus/Pro"))
+                        .child(
+                            Button::new("openai-codex-login", "Sign In With ChatGPT")
+                                .disabled(self.codex_login_task.is_some())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.start_codex_login(window, cx)
+                                })),
+                        )
+                        .child(
+                            Label::new(
+                                "This uses the Codex OAuth flow locally and routes the provider through the ChatGPT Codex backend.",
+                            )
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                        .when_some(self.codex_login_error.clone(), |this, error| {
+                            this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+                        })
+                        .when(self.codex_login_task.is_some(), |this| {
+                            this.child(
+                                Label::new("Waiting for ChatGPT login in your browser…")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border_variant),
+                )
+                .child(Label::new("API key"))
                 .child(
                     List::new()
                         .child(
@@ -549,17 +843,19 @@ impl Render for ConfigurationView {
                 )
                 .child(
                     Label::new(
-                        "Note that having a subscription for another service like GitHub Copilot won't work.",
+                        "API keys are billed through the OpenAI platform. ChatGPT subscriptions only work through the button above.",
                     )
                     .size(LabelSize::Small).color(Color::Muted),
                 )
                 .into_any_element()
         } else {
             ConfiguredApiCard::new(configured_card_label)
-                .disabled(env_var_set)
-                .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx)))
-                .when(env_var_set, |this| {
-                    this.tooltip_label(format!("To reset your API key, unset the {API_KEY_ENV_VAR_NAME} environment variable."))
+                .disabled(env_var_set && !has_codex_auth)
+                .on_click(cx.listener(|this, _, window, cx| this.reset_credentials(window, cx)))
+                .when(env_var_set && !has_codex_auth, |this| {
+                    this.tooltip_label(format!(
+                        "To reset your API key, unset the {API_KEY_ENV_VAR_NAME} environment variable."
+                    ))
                 })
                 .into_any_element()
         };

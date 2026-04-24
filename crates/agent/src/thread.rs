@@ -2539,6 +2539,21 @@ impl Thread {
         self.pending_title_generation.is_some()
     }
 
+    fn build_summarization_request_messages(
+        &self,
+        prompt: &'static str,
+        cx: &App,
+    ) -> Vec<LanguageModelRequestMessage> {
+        let mut messages = self.build_request_messages(Vec::new(), cx);
+        messages.push(LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![prompt.into()],
+            cache: false,
+            reasoning_details: None,
+        });
+        messages
+    }
+
     pub fn summary(&mut self, cx: &mut Context<Self>) -> Shared<Task<Option<SharedString>>> {
         if let Some(summary) = self.summary.as_ref() {
             return Task::ready(Some(summary.clone())).shared();
@@ -2550,22 +2565,12 @@ impl Thread {
             log::error!("No summarization model available");
             return Task::ready(None).shared();
         };
-        let mut request = LanguageModelRequest {
+        let request = LanguageModelRequest {
             intent: Some(CompletionIntent::ThreadContextSummarization),
             temperature: AgentSettings::temperature_for_model(&model, cx),
+            messages: self.build_summarization_request_messages(SUMMARIZE_THREAD_DETAILED_PROMPT, cx),
             ..Default::default()
         };
-
-        for message in &self.messages {
-            request.messages.extend(message.to_request());
-        }
-
-        request.messages.push(LanguageModelRequestMessage {
-            role: Role::User,
-            content: vec![SUMMARIZE_THREAD_DETAILED_PROMPT.into()],
-            cache: false,
-            reasoning_details: None,
-        });
 
         let task = cx
             .spawn(async move |this, cx| {
@@ -2608,22 +2613,12 @@ impl Thread {
             "Generating title with model: {:?}",
             self.summarization_model.as_ref().map(|model| model.name())
         );
-        let mut request = LanguageModelRequest {
+        let request = LanguageModelRequest {
             intent: Some(CompletionIntent::ThreadSummarization),
             temperature: AgentSettings::temperature_for_model(&model, cx),
+            messages: self.build_summarization_request_messages(SUMMARIZE_THREAD_PROMPT, cx),
             ..Default::default()
         };
-
-        for message in &self.messages {
-            request.messages.extend(message.to_request());
-        }
-
-        request.messages.push(LanguageModelRequestMessage {
-            role: Role::User,
-            content: vec![SUMMARIZE_THREAD_PROMPT.into()],
-            cache: false,
-            reasoning_details: None,
-        });
         self.pending_title_generation = Some(cx.spawn(async move |this, cx| {
             let mut title = String::new();
 
